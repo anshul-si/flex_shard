@@ -7,6 +7,7 @@
 from .bucket_storage import BucketSpec, MixedPrecisionPolicy, OffloadPolicy, PlacementFn
 from .checkpoint import get_flex_shard_global_layouts, set_state_dict_global_layouts
 from .flex_shard import flex_shard
+from .param_init import init_from_full
 from .placement_contract import (
     BucketParamStorageLayout,
     BucketStorageLayout,
@@ -30,6 +31,7 @@ __all__ = [
     "get_global_layout",
     "get_global_shape",
     "get_placements",
+    "init_from_full",
     "is_flex_shard_param",
     "LocalStorageLayout",
     "MixedPrecisionPolicy",
