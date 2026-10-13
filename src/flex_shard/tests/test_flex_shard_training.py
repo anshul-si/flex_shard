@@ -21,6 +21,7 @@ from torch.testing._internal.common_distributed import skip_if_lt_x_gpu
 from torch.testing._internal.common_fsdp import FSDPTest, get_devtype
 from torch.testing._internal.common_utils import run_tests
 from torch.utils.checkpoint import (
+    checkpoint,
     CheckpointPolicy,
     create_selective_checkpoint_contexts,
 )
@@ -333,6 +334,39 @@ def _checkpoint_transformer_execution_units(model: torch.nn.Module) -> None:
         model.output,
         context_fn=_prefer_recompute_context_fn,
     )
+
+
+class _RecomputeAtOutput(torch.autograd.Function):
+    """Identity that returns a view of the region output and saves an empty
+    tensor, so the region's recompute starts in this backward, as
+    torch_remat's ``_TriggerCheckpointRecompute`` does."""
+
+    @staticmethod
+    def forward(ctx, output: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(output.new_empty(0))
+        return output.view_as(output)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        # Unpacking the saved tensor runs the recompute.
+        (_,) = ctx.saved_tensors
+        return grad_output
+
+
+def _checkpoint_like_torch_remat(module: torch.nn.Module) -> None:
+    """Checkpoint ``module`` as torchtitan's ``RegionAC`` does with
+    ``torch_remat.checkpoint``: replace its forward, keeping its hooks and
+    parameter FQNs, with a non-reentrant checkpoint whose recompute replays
+    the original forward without the module's hooks."""
+    forward = module.forward
+
+    def region(*args: object) -> torch.Tensor:
+        return _RecomputeAtOutput.apply(forward(*args))
+
+    def checkpointed_forward(*args: object) -> torch.Tensor:
+        return checkpoint(region, *args, use_reentrant=False)
+
+    module.forward = checkpointed_forward
 
 
 class TestFlexShardTraining(FSDPTest):
@@ -1496,6 +1530,83 @@ class TestFlexShardTraining(FSDPTest):
         optim.step()
         ref_optim.step()
         check_flex_shard_parity(self, reference, model, self.rank, self.world_size)
+
+    @skip_if_lt_x_gpu(2)
+    def test_reshard_after_forward_with_torch_remat_checkpointing(self):
+        # torch_remat replays a block's forward directly, so the block's
+        # forward hooks don't run in the recompute, and starts the replay in
+        # the backward of an autograd Function viewing the block's output. The
+        # block's bucket must be unsharded before that backward.
+        # _checkpoint_like_torch_remat reproduces both, without depending on
+        # torch_remat.
+        mesh = init_device_mesh(
+            device_type.type,
+            (self.world_size,),
+            mesh_dim_names=("fsdp",),
+        )
+
+        def nested_layer_buckets(specs: list[BucketSpec]) -> list[BucketSpec]:
+            # As torchtitan's MoE blocks: a bucket hooked on the block and
+            # buckets hooked on modules inside it, which the replay calls.
+            nested = []
+            for spec in specs:
+                (pattern,) = spec.patterns
+                if not pattern.startswith("layers."):
+                    nested.append(spec)
+                    continue
+                layer = pattern.removesuffix(".*")
+                nested += [
+                    dataclasses.replace(
+                        spec,
+                        patterns=[f"{layer}.attention_norm.*", f"{layer}.ffn_norm.*"],
+                    ),
+                    dataclasses.replace(spec, patterns=[f"{layer}.attention.*"]),
+                    dataclasses.replace(spec, patterns=[f"{layer}.feed_forward.*"]),
+                ]
+            return nested
+
+        for nested in (False, True):
+            with self.subTest(nested=nested):
+                args, model = make_transformer_model(
+                    device=device_type.type,
+                    n_layers=2,
+                    vocab_size=15,
+                )
+                _init_params_deterministically(model)
+                reference = copy.deepcopy(model)
+                for layer in model.layers:
+                    _checkpoint_like_torch_remat(layer)
+                buckets = transformer_bucket_specs(
+                    args.n_layers,
+                    mesh,
+                    reshard_after_forward=True,
+                )
+                flex_shard(
+                    model,
+                    buckets=nested_layer_buckets(buckets) if nested else buckets,
+                )
+
+                torch.manual_seed(42 + self.rank + 1)
+                x = transformer_inputs(args, batch_size=3, device=device_type)
+                optim = make_test_sgd(model.parameters(), lr=0.1)
+                ref_optim = make_test_sgd(reference.parameters(), lr=0.1)
+                for _ in range(2):
+                    optim.zero_grad(set_to_none=True)
+                    ref_optim.zero_grad(set_to_none=True)
+                    loss = model(x).sum()
+                    ref_loss = reference(x).sum()
+                    self.assertEqual(loss, ref_loss)
+                    loss.backward()
+                    ref_loss.backward()
+                    _average_reference_grads(reference)
+                    check_flex_shard_parity(
+                        self, reference, model, self.rank, self.world_size
+                    )
+                    optim.step()
+                    ref_optim.step()
+                check_flex_shard_parity(
+                    self, reference, model, self.rank, self.world_size
+                )
 
     @skip_if_lt_x_gpu(2)
     def test_submodule_buckets_under_selective_activation_checkpointing(self):

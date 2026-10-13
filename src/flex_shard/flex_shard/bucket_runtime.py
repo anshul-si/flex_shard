@@ -1028,16 +1028,16 @@ class BucketRuntime:
             return
         self.input_triggers += has_trigger
         for value in grad_outputs:
-            # Hook the node of a view output's base: an in-place op on the view
-            # replaces the view's node, which would drop a hook on it. Leaves
-            # (e.g. a returned param) get none: hooks on them would persist.
+            # Hook the output's node, which backward reaches first: torch_remat
+            # returns a view whose node starts the checkpoint recompute, which
+            # replays the forward without its hooks. Also hook the node of a
+            # view output's base: an in-place op on the view replaces the
+            # view's node, which would drop a hook on it. The hook may run once
+            # per node. Leaves (e.g. a returned param) get none: hooks on them
+            # would persist.
             base = value._base
-            node = (
-                base.grad_fn
-                if base is not None and base.grad_fn is not None
-                else value.grad_fn
-            )
-            if node is not None:
+            nodes = {value.grad_fn, None if base is None else base.grad_fn}
+            for node in nodes - {None}:
                 node.register_prehook(self.pre_backward_hook)
         if self.bucket_storage._reshard_after_forward:
             persistent = {_storage_ptr(buffer) for buffer in self.persistent_buffers}
