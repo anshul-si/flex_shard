@@ -24,12 +24,13 @@ from .. import (
     MixedPrecisionPolicy,
 )
 from ..custom_placements import (
+    blockwise_quant_bucketed_block_shard as blockwise_quant_module,
     fp8_bucketed_block_shard as fp8_bucketed_block_shard_module,
 )
-from ..custom_placements.fp8_bucketed_block_shard import (
+from ..custom_placements.blockwise_quant_bucketed_block_shard import (
     _VEC_ALIGN_BYTES,
-    Fp8BucketedBlockShard,
 )
+from ..custom_placements.fp8_bucketed_block_shard import Fp8BucketedBlockShard
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..flex_shard.bucket_storage import ParamInfo, ShardedBucketStorage
 from .common import single_rank_cpu_mesh
@@ -45,17 +46,17 @@ def _reference_blockwise_quant_weight(
     fp8_dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a weight without using the production TorchAO kernel."""
-    fp8_bucketed_block_shard_module._validate_block_size(block_size)
-    out_dim, in_dim = fp8_bucketed_block_shard_module._validate_2d_non_empty(
+    blockwise_quant_module._validate_block_size(block_size)
+    out_dim, in_dim = blockwise_quant_module._validate_2d_non_empty(
         weight.shape,
         "reference blockwise quantization",
     )
-    padded_weight = fp8_bucketed_block_shard_module._pad_2d_to_block_shape(
+    padded_weight = blockwise_quant_module._pad_2d_to_block_shape(
         weight,
         block_size,
     )
     padded_out_dim, padded_in_dim = padded_weight.shape
-    scale_rows, scale_cols = fp8_bucketed_block_shard_module._scale_shape(
+    scale_rows, scale_cols = blockwise_quant_module._scale_shape(
         weight.shape,
         block_size,
     )
@@ -192,10 +193,10 @@ def _make_fp8_param_infos(
 def _packed_rank_views(
     packed: torch.Tensor,
     rank: int,
-    metadata: Fp8BucketedBlockShard._Fp8BucketMetadata,
+    metadata: Fp8BucketedBlockShard._QuantBucketMetadata,
     fp8_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    fp8_nbytes = metadata.rank_fp8_numels[rank]
+    fp8_nbytes = metadata.rank_qdata_numels[rank]
     scale_start = metadata.rank_scale_byte_offsets[rank]
     scale_end = scale_start + metadata.rank_scale_numels[rank] * torch.float32.itemsize
     return (
@@ -211,7 +212,7 @@ def _cpu_reference_quantize_local_weight(
     return _reference_blockwise_quant_weight(
         tensor,
         placement.block_size,
-        placement.fp8_dtype,
+        placement.qdata_dtype,
     )
 
 
@@ -418,7 +419,7 @@ class TestFp8AllGatherLayout(TestCase):
             prepared.buffers[0],
             0,
             prepared.placement_state.metadata,
-            placement.fp8_dtype,
+            placement.qdata_dtype,
         )
         reference_fp8, reference_scale = _reference_blockwise_quant_weight(
             full_weight.to(torch.bfloat16),
@@ -444,7 +445,7 @@ class TestFp8AllGatherLayout(TestCase):
         ):
             weight_factory = _RecordingWeightFactory()
             mixed = MixedBucketPlacement({})
-            fp8 = mixed.fp8_bucketed_block_shard(
+            fp8 = mixed.blockwise_quant_bucketed_block_shard(
                 Fp8BucketedBlockShard(
                     world_size=1,
                     weight_factory=weight_factory,
@@ -501,7 +502,7 @@ class TestFp8AllGatherLayout(TestCase):
         payloads = []
 
         def function(tensor: torch.Tensor) -> torch.Tensor:
-            phases.append(fp8_bucketed_block_shard_module._is_backward_graph_task())
+            phases.append(blockwise_quant_module._is_backward_graph_task())
             prepared = placement.prepare_unshard_bucket(
                 [param.detach()],
                 [info],
@@ -537,7 +538,7 @@ class TestFp8AllGatherLayout(TestCase):
 
         with (
             patch.object(
-                fp8_bucketed_block_shard_module,
+                blockwise_quant_module,
                 "_is_backward_graph_task",
                 return_value=False,
             ),
@@ -573,7 +574,7 @@ class TestFp8AllGatherLayout(TestCase):
             second.buffers[0],
             0,
             second.placement_state.metadata,
-            placement.fp8_dtype,
+            placement.qdata_dtype,
         )
         reference_fp8, reference_scale = _reference_blockwise_quant_weight(
             param.detach(),
@@ -617,7 +618,7 @@ class TestFp8AllGatherLayout(TestCase):
             )
 
         with patch.object(
-            fp8_bucketed_block_shard_module,
+            blockwise_quant_module,
             "_is_backward_graph_task",
             return_value=True,
         ):
@@ -710,7 +711,7 @@ class TestFp8AllGatherLayout(TestCase):
         self.assertEqual(rank_rows.storage_offset() % torch.float32.itemsize, 1)
         for rank, rank_prepared in enumerate(prepared_by_rank):
             local_packed = rank_prepared.buffers[0]
-            fp8_end = metadata.rank_fp8_numels[rank]
+            fp8_end = metadata.rank_qdata_numels[rank]
             scale_start = metadata.rank_scale_byte_offsets[rank]
             payload_end = metadata.rank_packed_nbytes[rank]
             rank_rows[rank, :fp8_end].copy_(local_packed[:fp8_end])
@@ -724,7 +725,7 @@ class TestFp8AllGatherLayout(TestCase):
         compact = result.persistent_buffers[0]
         expected_fp8_nbytes = sum(param.numel() for _, param in named_params)
         self.assertNotEqual(expected_fp8_nbytes % torch.float32.itemsize, 0)
-        self.assertIn(0, metadata.rank_fp8_numels)
+        self.assertIn(0, metadata.rank_qdata_numels)
         expected_scale_numel = sum(
             ((param.shape[0] + block - 1) // block)
             * ((param.shape[1] + block - 1) // block)
@@ -938,7 +939,7 @@ class TestFp8AllGather(FSDPTest):
             block_size=block,
         )
         mixed = MixedBucketPlacement({})
-        weight_placement = mixed.fp8_bucketed_block_shard(raw_placement)
+        weight_placement = mixed.blockwise_quant_bucketed_block_shard(raw_placement)
         placements = {
             "norm": (mixed.shard0,),
             "weight": (weight_placement,),
