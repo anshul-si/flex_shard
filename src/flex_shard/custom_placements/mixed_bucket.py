@@ -36,6 +36,7 @@ from .blockwise_quant_bucketed_block_shard import (
     BlockwiseQuantBucketedBlockShard,
 )
 from .fp8_bucketed_block_shard import Fp8BucketedBlockShard
+from .mxfp8_bucketed_block_shard import Mxfp8BucketedBlockShard
 from .owned import BucketedOwned
 from .owner_rows_transport import (
     gather_owner_rows,
@@ -327,6 +328,27 @@ class _MixedFp8BucketedBlockShard(
         self._collective_placement = placement
 
 
+class _MixedMxfp8BucketedBlockShard(
+    _MixedBlockwiseQuantMember,
+    Mxfp8BucketedBlockShard,
+):
+    """Optimizer-visible MXFP8 member of one mixed bucket placement."""
+
+    def __init__(
+        self,
+        mixed_bucket: MixedBucketPlacement,
+        placement: Mxfp8BucketedBlockShard,
+    ) -> None:
+        Mxfp8BucketedBlockShard.__init__(
+            self,
+            world_size=placement.world_size,
+            weight_factory=placement.weight_factory,
+            scaling_mode=placement.scaling_mode,
+        )
+        self._mixed_bucket = mixed_bucket
+        self._collective_placement = placement
+
+
 # Each member type's constructor takes the mixed bucket and the collective
 # placement it copies.
 _MIXED_BLOCKWISE_QUANT_MEMBER_TYPES: dict[
@@ -334,6 +356,7 @@ _MIXED_BLOCKWISE_QUANT_MEMBER_TYPES: dict[
     Callable[[MixedBucketPlacement, Any], _MixedBlockwiseQuantMember],
 ] = {
     Fp8BucketedBlockShard: _MixedFp8BucketedBlockShard,
+    Mxfp8BucketedBlockShard: _MixedMxfp8BucketedBlockShard,
 }
 
 
