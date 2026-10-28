@@ -9,6 +9,7 @@ from .block_shard import (
     BucketedBlockShard,
     make_bucketed_block_placement_fn,
 )
+from .blockwise_quant_bucketed_block_shard import BlockwiseQuantBucketedBlockShard
 from .fp8_bucketed_block_shard import (
     BlockwiseFp8WeightFactory,
     Fp8BucketedBlockShard,
@@ -35,6 +36,7 @@ __all__ = [
     "make_shard_placement_fn",
     "MixedBucketPlacement",
     "BlockwiseFp8WeightFactory",
+    "BlockwiseQuantBucketedBlockShard",
     "Fp8BucketedBlockShard",
     "BucketedBlockShard",
     "make_fp8_bucketed_block_placement_fn",
