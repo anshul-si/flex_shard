@@ -33,7 +33,7 @@ from ..custom_placements.blockwise_quant_bucketed_block_shard import (
 from ..custom_placements.fp8_bucketed_block_shard import Fp8BucketedBlockShard
 from ..custom_placements.mixed_bucket import MixedBucketPlacement
 from ..flex_shard.bucket_storage import ParamInfo, ShardedBucketStorage
-from .common import single_rank_cpu_mesh
+from .common import FakeMesh, make_param_infos, single_rank_cpu_mesh
 
 
 device_type = torch.device(get_devtype())
@@ -134,60 +134,13 @@ class _RecordingWeightFactory:
         return fp8_data
 
 
-class _FakeMesh:
-    """Minimal mesh for exercising bucket_storage_layout without a real PG."""
-
-    def __init__(self, size: int, rank: int = 0) -> None:
-        self._size = size
-        self._rank = rank
-
-    def size(self) -> int:
-        return self._size
-
-    def get_local_rank(self) -> int:
-        return self._rank
-
-    def get_group(self):
-        return None
-
-
 def _make_fp8_param_info(
     fqn: str,
     param: nn.Parameter,
     placement: Fp8BucketedBlockShard,
-    mesh: _FakeMesh,
+    mesh: FakeMesh,
 ) -> ParamInfo:
-    return _make_fp8_param_infos([(fqn, param)], placement, mesh)[0]
-
-
-def _make_fp8_param_infos(
-    named_params: list[tuple[str, nn.Parameter]],
-    placement: Fp8BucketedBlockShard,
-    mesh: _FakeMesh,
-) -> list[ParamInfo]:
-    placements = {fqn: (placement,) for fqn, _ in named_params}
-    layout = placement.bucket_storage_layout(
-        named_params,
-        placements,
-        mesh,
-    )
-    return [
-        ParamInfo(
-            fqn=fqn,
-            global_shape=param.shape,
-            global_stride=tuple(param.stride()),
-            dtype=param.dtype,
-            requires_grad=param.requires_grad,
-            placements=(placement,),
-            local_shape=layout.param_layouts[fqn].local_shape,
-            local_numel=layout.param_layouts[fqn].local_numel,
-            byte_offset=layout.param_layouts[fqn].byte_offset,
-            storage_nbytes=layout.param_layouts[fqn].storage_nbytes,
-            global_numel=param.numel(),
-            bucket_layout=layout.param_layouts[fqn].bucket_layout,
-        )
-        for fqn, param in named_params
-    ]
+    return make_param_infos([(fqn, param)], placement, mesh)[0]
 
 
 def _packed_rank_views(
@@ -240,8 +193,8 @@ def _prepare_unshard_on_each_rank(
 ) -> list:
     prepared_by_rank = []
     for rank in range(world_size):
-        mesh = _FakeMesh(world_size, rank)
-        infos = _make_fp8_param_infos(named_params, placement, mesh)
+        mesh = FakeMesh(world_size, rank)
+        infos = make_param_infos(named_params, placement, mesh)
         local_tensors = [
             _local_rows(param, info)
             for (_, param), info in zip(named_params, infos, strict=True)
@@ -285,13 +238,13 @@ class TestFp8AllGatherLayout(TestCase):
             placement.bucket_storage_layout(
                 [("w", nn.Parameter(torch.zeros(16)))],
                 {"w": (placement,)},
-                _FakeMesh(2),
+                FakeMesh(2),
             )
         with self.assertRaisesRegex(ValueError, "non-empty"):
             placement.bucket_storage_layout(
                 [("w", nn.Parameter(torch.zeros(0, 8)))],
                 {"w": (placement,)},
-                _FakeMesh(2),
+                FakeMesh(2),
             )
         with self.assertRaisesRegex(ValueError, "one-byte"):
             Fp8BucketedBlockShard(
@@ -310,7 +263,7 @@ class TestFp8AllGatherLayout(TestCase):
             placement.bucket_storage_layout(
                 named,
                 placements,
-                _FakeMesh(2, rank=rank),
+                FakeMesh(2, rank=rank),
             )
             for rank in range(2)
         ]
@@ -354,7 +307,7 @@ class TestFp8AllGatherLayout(TestCase):
                 partial_placement.bucket_storage_layout(
                     partial,
                     partial_placements,
-                    _FakeMesh(2, rank=0),
+                    FakeMesh(2, rank=0),
                 )
                 .param_layouts["w"]
                 .local_shape
@@ -366,7 +319,7 @@ class TestFp8AllGatherLayout(TestCase):
                 partial_placement.bucket_storage_layout(
                     partial,
                     partial_placements,
-                    _FakeMesh(2, rank=1),
+                    FakeMesh(2, rank=1),
                 )
                 .param_layouts["w"]
                 .local_shape
@@ -383,7 +336,7 @@ class TestFp8AllGatherLayout(TestCase):
         empty_rank_layout = empty_rank_placement.bucket_storage_layout(
             empty_rank_named,
             {"w": (empty_rank_placement,)},
-            _FakeMesh(4, rank=3),
+            FakeMesh(4, rank=3),
         )
         self.assertEqual(empty_rank_layout.total_bytes, 0)
         self.assertEqual(empty_rank_layout.param_layouts["w"].local_numel, 0)
@@ -392,7 +345,7 @@ class TestFp8AllGatherLayout(TestCase):
     def test_fp8_unshard_quantizes_param_dtype(self) -> None:
         """FP32 master shards are cast to the BF16 compute dtype before quantization."""
         block = 4
-        mesh = _FakeMesh(1)
+        mesh = FakeMesh(1)
         placement = Fp8BucketedBlockShard(
             world_size=1,
             weight_factory=_return_fp8_data,
@@ -488,7 +441,7 @@ class TestFp8AllGatherLayout(TestCase):
     def test_fp8_cache_phase_detects_checkpoint_recompute(self) -> None:
         from torch.utils.checkpoint import checkpoint
 
-        mesh = _FakeMesh(1)
+        mesh = FakeMesh(1)
         placement = Fp8BucketedBlockShard(
             world_size=1,
             weight_factory=_return_fp8_data,
@@ -525,7 +478,7 @@ class TestFp8AllGatherLayout(TestCase):
         self.assertIs(payloads[0], payloads[1])
 
     def test_fp8_local_packed_cache_rebuilds_every_forward(self) -> None:
-        mesh = _FakeMesh(1)
+        mesh = FakeMesh(1)
         placement = Fp8BucketedBlockShard(
             world_size=1,
             weight_factory=_return_fp8_data,
@@ -586,7 +539,7 @@ class TestFp8AllGatherLayout(TestCase):
         )
 
     def test_fp8_local_packed_cache_is_bypassed_while_compiling(self) -> None:
-        mesh = _FakeMesh(1)
+        mesh = FakeMesh(1)
         placement = Fp8BucketedBlockShard(
             world_size=1,
             weight_factory=_return_fp8_data,
@@ -634,7 +587,7 @@ class TestFp8AllGatherLayout(TestCase):
 
     def test_fp8_unshard_uses_single_packed_all_gather(self) -> None:
         """The FP8 placement launches one collective over packed bytes."""
-        mesh = _FakeMesh(2)
+        mesh = FakeMesh(2)
         placement = Fp8BucketedBlockShard(
             world_size=2,
             weight_factory=_return_fp8_data,
@@ -788,7 +741,7 @@ class TestFp8AllGatherLayout(TestCase):
         )
         param = nn.Parameter(torch.arange(96, dtype=torch.float32).reshape(2, 6, 8))
         infos = [
-            _make_fp8_param_info("w13", param, placement, _FakeMesh(world_size, rank))
+            _make_fp8_param_info("w13", param, placement, FakeMesh(world_size, rank))
             for rank in range(world_size)
         ]
         self.assertEqual(
