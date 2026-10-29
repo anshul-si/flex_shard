@@ -16,6 +16,11 @@ from .fp8_bucketed_block_shard import (
     make_fp8_bucketed_block_placement_fn,
 )
 from .mixed_bucket import MixedBucketPlacement
+from .mxfp8_bucketed_block_shard import (
+    BlockwiseMxfp8WeightFactory,
+    make_mxfp8_bucketed_block_placement_fn,
+    Mxfp8BucketedBlockShard,
+)
 from .owned import (
     BucketedOwned,
     BucketedOwnedSegmentSpec,
@@ -36,6 +41,9 @@ __all__ = [
     "make_shard_placement_fn",
     "MixedBucketPlacement",
     "BlockwiseFp8WeightFactory",
+    "BlockwiseMxfp8WeightFactory",
+    "make_mxfp8_bucketed_block_placement_fn",
+    "Mxfp8BucketedBlockShard",
     "BlockwiseQuantBucketedBlockShard",
     "Fp8BucketedBlockShard",
     "BucketedBlockShard",
